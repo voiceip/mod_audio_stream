@@ -10,3 +10,4 @@ recordings/
 .DS_Store
 *.log
 .env
+assets

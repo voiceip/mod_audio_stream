@@ -17,6 +17,7 @@ services:
       dockerfile: docker/sipproxy/Dockerfile
       platforms:
         - linux/amd64
+        - linux/arm64
     networks:
       sip:
         ipv4_address: 10.25.0.2
