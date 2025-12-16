@@ -575,7 +575,9 @@ namespace
 
         while (!tech_pvt->close_requested && switch_core_session_running(session))
         {
-            if (switch_mutex_trylock(tech_pvt->read_mutex) == SWITCH_STATUS_SUCCESS)
+            // Use blocking lock to ensure we can send continuously
+            // stream_frame() uses trylock so it won't block us for long
+            if (switch_mutex_lock(tech_pvt->read_mutex) == SWITCH_STATUS_SUCCESS)
             {
                 if (!tech_pvt->pAudioStreamer)
                 {
@@ -593,10 +595,19 @@ namespace
                     {
                         std::vector<uint8_t> tmp(bytes);
                         switch_buffer_read(tech_pvt->read_sbuffer, tmp.data(), bytes);
+                        // Release lock before sending to avoid blocking stream_frame() for too long
+                        switch_mutex_unlock(tech_pvt->read_mutex);
                         pAudioStreamer->writeBinary(tmp.data(), bytes);
                     }
+                    else
+                    {
+                        switch_mutex_unlock(tech_pvt->read_mutex);
+                    }
                 }
-                switch_mutex_unlock(tech_pvt->read_mutex);
+                else
+                {
+                    switch_mutex_unlock(tech_pvt->read_mutex);
+                }
             }
             switch_core_timer_next(&timer);
         }
@@ -1023,8 +1034,8 @@ extern "C"
                 if (frame.datalen)
                 {
                     // Always buffer audio - the read_frame_thread will handle sending
-                    // Use blocking lock to ensure frames are buffered (read_frame_thread releases quickly)
-                    if (switch_mutex_lock(tech_pvt->read_mutex) == SWITCH_STATUS_SUCCESS)
+                    // Use trylock to avoid blocking the read_frame_thread which needs to send continuously
+                    if (switch_mutex_trylock(tech_pvt->read_mutex) == SWITCH_STATUS_SUCCESS)
                     {
                         size_t available = switch_buffer_freespace(tech_pvt->read_sbuffer);
                         if (available >= frame.datalen)
@@ -1039,6 +1050,8 @@ extern "C"
                         }
                         switch_mutex_unlock(tech_pvt->read_mutex);
                     }
+                    // If we can't get the lock, the read_frame_thread is busy sending
+                    // Drop this frame - it's better to drop occasionally than block bidirectional streaming
                 }
             }
         }
@@ -1078,27 +1091,29 @@ extern "C"
                                                                 &out_len);
                     }
 
-                    if (out_len > 0)
-                    {
-                        const size_t bytes_written = out_len * bytes_per_sample;
-                        // Always buffer audio - the read_frame_thread will handle sending
-                        // Use blocking lock to ensure frames are buffered (read_frame_thread releases quickly)
-                        if (switch_mutex_lock(tech_pvt->read_mutex) == SWITCH_STATUS_SUCCESS)
+                        if (out_len > 0)
                         {
-                            size_t available = switch_buffer_freespace(tech_pvt->read_sbuffer);
-                            if (bytes_written <= available)
+                            const size_t bytes_written = out_len * bytes_per_sample;
+                            // Always buffer audio - the read_frame_thread will handle sending
+                            // Use trylock to avoid blocking the read_frame_thread which needs to send continuously
+                            if (switch_mutex_trylock(tech_pvt->read_mutex) == SWITCH_STATUS_SUCCESS)
                             {
-                                switch_buffer_write(tech_pvt->read_sbuffer, reinterpret_cast<const uint8_t *>(out.data()), bytes_written);
+                                size_t available = switch_buffer_freespace(tech_pvt->read_sbuffer);
+                                if (bytes_written <= available)
+                                {
+                                    switch_buffer_write(tech_pvt->read_sbuffer, reinterpret_cast<const uint8_t *>(out.data()), bytes_written);
+                                }
+                                else
+                                {
+                                    // Buffer is full, drop frame to prevent blocking
+                                    switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(switch_core_media_bug_get_session(bug)), SWITCH_LOG_WARNING,
+                                                      "read_sbuffer full, dropping %zu bytes\n", bytes_written);
+                                }
+                                switch_mutex_unlock(tech_pvt->read_mutex);
                             }
-                            else
-                            {
-                                // Buffer is full, drop frame to prevent blocking
-                                switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(switch_core_media_bug_get_session(bug)), SWITCH_LOG_WARNING,
-                                                  "read_sbuffer full, dropping %zu bytes\n", bytes_written);
-                            }
-                            switch_mutex_unlock(tech_pvt->read_mutex);
+                            // If we can't get the lock, the read_frame_thread is busy sending
+                            // Drop this frame - it's better to drop occasionally than block bidirectional streaming
                         }
-                    }
                 }
             }
         }
