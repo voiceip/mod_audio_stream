@@ -1,5 +1,6 @@
 #include <string>
 #include <cstring>
+#include <vector>
 #include "mod_audio_stream.h"
 #include "WebSocketClient.h"
 #include <switch_json.h>
@@ -472,7 +473,8 @@ namespace
         uint32_t interval = read_codec->implementation->microseconds_per_packet / 1000;
         uint32_t samples = switch_samples_per_packet(sample_rate, interval);
         uint32_t tsamples = read_codec->implementation->actual_samples_per_second;
-        uint32_t bytes = samples * 2 * channels;
+        // Use sizeof(spx_int16_t) instead of magic number 2
+        uint32_t bytes = samples * sizeof(spx_int16_t) * channels;
 
         if (switch_core_codec_init(&write_codec, "L16", NULL, NULL, sample_rate, interval, channels,
                                    SWITCH_CODEC_FLAG_ENCODE | SWITCH_CODEC_FLAG_DECODE, NULL,
@@ -500,12 +502,20 @@ namespace
         {
             if (switch_mutex_trylock(tech_pvt->write_mutex) == SWITCH_STATUS_SUCCESS)
             {
-                switch_size_t available = switch_buffer_inuse(tech_pvt->write_sbuffer);
-                if (available >= bytes)
+                if (tech_pvt->write_sbuffer && bytes > 0 && channels > 0)
                 {
-                    write_frame.datalen = (uint32_t)switch_buffer_read(tech_pvt->write_sbuffer, write_frame.data, bytes);
-                    write_frame.samples = write_frame.datalen / 2 / channels;
-                    switch_core_session_write_frame(session, &write_frame, SWITCH_IO_FLAG_NONE, 0);
+                    switch_size_t available = switch_buffer_inuse(tech_pvt->write_sbuffer);
+                    if (available >= bytes)
+                    {
+                        write_frame.datalen = (uint32_t)switch_buffer_read(tech_pvt->write_sbuffer, write_frame.data, bytes);
+                        // Use sizeof(spx_int16_t) instead of magic number 2
+                        const size_t bytes_per_sample = sizeof(spx_int16_t) * channels;
+                        write_frame.samples = (bytes_per_sample > 0) ? (write_frame.datalen / bytes_per_sample) : 0;
+                        if (write_frame.samples > 0)
+                        {
+                            switch_core_session_write_frame(session, &write_frame, SWITCH_IO_FLAG_NONE, 0);
+                        }
+                    }
                 }
                 switch_mutex_unlock(tech_pvt->write_mutex);
             }
@@ -549,7 +559,8 @@ namespace
         uint32_t sample_rate = tech_pvt->wsSampling;
         uint32_t channels = tech_pvt->channels;
         uint32_t samples = switch_samples_per_packet(sample_rate, interval);
-        uint32_t bytes = samples * 2 * channels;
+        // Use sizeof(spx_int16_t) instead of magic number 2
+        uint32_t bytes = samples * sizeof(spx_int16_t) * channels;
 
         switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "started read frame thread with sample rate [%u] interval [%u] samples [%u] bytes [%u]\n", sample_rate, interval, samples, bytes);
 
@@ -575,10 +586,10 @@ namespace
 
                 auto *pAudioStreamer = static_cast<AudioStreamer *>(tech_pvt->pAudioStreamer);
 
-                if (pAudioStreamer->isConnected() && !tech_pvt->audio_paused)
+                if (pAudioStreamer && pAudioStreamer->isConnected() && !tech_pvt->audio_paused && tech_pvt->read_sbuffer)
                 {
                     switch_size_t available = switch_buffer_inuse(tech_pvt->read_sbuffer);
-                    if (available >= bytes)
+                    if (available >= bytes && bytes > 0)
                     {
                         std::vector<uint8_t> tmp(bytes);
                         switch_buffer_read(tech_pvt->read_sbuffer, tmp.data(), bytes);
@@ -991,127 +1002,105 @@ extern "C"
     switch_bool_t stream_frame(switch_media_bug_t *bug)
     {
         auto *tech_pvt = (private_t *)switch_core_media_bug_get_user_data(bug);
-        if (!tech_pvt || tech_pvt->audio_paused)
+        if (!tech_pvt || tech_pvt->audio_paused || !tech_pvt->read_sbuffer)
             return SWITCH_TRUE;
-        /*
-        auto flush_read_sbuffer = [&]() {
-            switch_size_t inuse = switch_buffer_inuse(tech_pvt->read_sbuffer);
-            if (inuse > 0) {
-                std::vector<uint8_t> tmp(inuse);
-                switch_buffer_read(tech_pvt->read_sbuffer, tmp.data(), inuse);
-                switch_buffer_zero(tech_pvt->read_sbuffer);
-                pAudioStreamer->writeBinary(tmp.data(), inuse);
-            }
-        };
-        */
-        if (switch_mutex_trylock(tech_pvt->mutex) == SWITCH_STATUS_SUCCESS)
+
+        // Always process and buffer audio frames when called
+        // The read_frame_thread will check connection status before sending
+        // This ensures audio continues to be buffered even if main mutex is held
+
+        // Process audio frames - always buffer them regardless of connection status
+        // The read_frame_thread will handle sending when connected
+        if (nullptr == tech_pvt->read_resampler)
         {
+            uint8_t data_buf[SWITCH_RECOMMENDED_BUFFER_SIZE];
+            switch_frame_t frame = {0};
+            frame.data = data_buf;
+            frame.buflen = SWITCH_RECOMMENDED_BUFFER_SIZE;
 
-            if (!tech_pvt->pAudioStreamer)
+            while (switch_core_media_bug_read(bug, &frame, SWITCH_TRUE) == SWITCH_STATUS_SUCCESS)
             {
-                switch_mutex_unlock(tech_pvt->mutex);
-                return SWITCH_TRUE;
-            }
-
-            auto *pAudioStreamer = static_cast<AudioStreamer *>(tech_pvt->pAudioStreamer);
-
-            if (!pAudioStreamer->isConnected())
-            {
-                switch_mutex_unlock(tech_pvt->mutex);
-                return SWITCH_TRUE;
-            }
-
-            if (nullptr == tech_pvt->read_resampler)
-            {
-
-                uint8_t data_buf[SWITCH_RECOMMENDED_BUFFER_SIZE];
-                switch_frame_t frame = {0};
-                frame.data = data_buf;
-                frame.buflen = SWITCH_RECOMMENDED_BUFFER_SIZE;
-
-                while (switch_core_media_bug_read(bug, &frame, SWITCH_TRUE) == SWITCH_STATUS_SUCCESS)
+                if (frame.datalen)
                 {
-                    if (frame.datalen)
+                    // Always buffer audio - the read_frame_thread will handle sending
+                    // Use blocking lock to ensure frames are buffered (read_frame_thread releases quickly)
+                    if (switch_mutex_lock(tech_pvt->read_mutex) == SWITCH_STATUS_SUCCESS)
                     {
+                        size_t available = switch_buffer_freespace(tech_pvt->read_sbuffer);
+                        if (available >= frame.datalen)
+                        {
+                            switch_buffer_write(tech_pvt->read_sbuffer, static_cast<uint8_t *>(frame.data), frame.datalen);
+                        }
+                        else
+                        {
+                            // Buffer is full, drop frame to prevent blocking
+                            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(switch_core_media_bug_get_session(bug)), SWITCH_LOG_WARNING,
+                                              "read_sbuffer full, dropping %zu bytes\n", frame.datalen);
+                        }
+                        switch_mutex_unlock(tech_pvt->read_mutex);
+                    }
+                }
+            }
+        }
+        else
+        {
+            uint8_t data[SWITCH_RECOMMENDED_BUFFER_SIZE];
+            switch_frame_t frame = {};
+            frame.data = data;
+            frame.buflen = SWITCH_RECOMMENDED_BUFFER_SIZE;
+
+            while (switch_core_media_bug_read(bug, &frame, SWITCH_TRUE) == SWITCH_STATUS_SUCCESS)
+            {
+                if (frame.datalen && tech_pvt->channels > 0)
+                {
+                    spx_uint32_t in_len = frame.samples;
+                    const size_t bytes_per_sample = tech_pvt->channels * sizeof(spx_int16_t);
+                    const size_t max_out_samples = (SWITCH_RECOMMENDED_BUFFER_SIZE / bytes_per_sample);
+                    spx_uint32_t out_len = max_out_samples;
+                    // Use vector instead of large stack array to avoid stack overflow
+                    std::vector<spx_int16_t> out(max_out_samples * tech_pvt->channels);
+
+                    if (tech_pvt->channels == 1)
+                    {
+                        speex_resampler_process_int(tech_pvt->read_resampler,
+                                                    0,
+                                                    (const spx_int16_t *)frame.data,
+                                                    &in_len,
+                                                    out.data(),
+                                                    &out_len);
+                    }
+                    else
+                    {
+                        speex_resampler_process_interleaved_int(tech_pvt->read_resampler,
+                                                                (const spx_int16_t *)frame.data,
+                                                                &in_len,
+                                                                out.data(),
+                                                                &out_len);
+                    }
+
+                    if (out_len > 0)
+                    {
+                        const size_t bytes_written = out_len * bytes_per_sample;
                         // Always buffer audio - the read_frame_thread will handle sending
-                        if (switch_mutex_trylock(tech_pvt->read_mutex) == SWITCH_STATUS_SUCCESS)
+                        // Use blocking lock to ensure frames are buffered (read_frame_thread releases quickly)
+                        if (switch_mutex_lock(tech_pvt->read_mutex) == SWITCH_STATUS_SUCCESS)
                         {
                             size_t available = switch_buffer_freespace(tech_pvt->read_sbuffer);
-                            if (available >= frame.datalen)
+                            if (bytes_written <= available)
                             {
-                                switch_buffer_write(tech_pvt->read_sbuffer, static_cast<uint8_t *>(frame.data), frame.datalen);
+                                switch_buffer_write(tech_pvt->read_sbuffer, reinterpret_cast<const uint8_t *>(out.data()), bytes_written);
                             }
                             else
                             {
                                 // Buffer is full, drop frame to prevent blocking
                                 switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(switch_core_media_bug_get_session(bug)), SWITCH_LOG_WARNING,
-                                                  "read_sbuffer full, dropping %zu bytes\n", frame.datalen);
+                                                  "read_sbuffer full, dropping %zu bytes\n", bytes_written);
                             }
                             switch_mutex_unlock(tech_pvt->read_mutex);
                         }
                     }
                 }
             }
-            else
-            {
-
-                uint8_t data[SWITCH_RECOMMENDED_BUFFER_SIZE];
-                switch_frame_t frame = {};
-                frame.data = data;
-                frame.buflen = SWITCH_RECOMMENDED_BUFFER_SIZE;
-
-                while (switch_core_media_bug_read(bug, &frame, SWITCH_TRUE) == SWITCH_STATUS_SUCCESS)
-                {
-                    if (frame.datalen)
-                    {
-                        spx_uint32_t in_len = frame.samples;
-                        const size_t max_out_samples = (SWITCH_RECOMMENDED_BUFFER_SIZE / (tech_pvt->channels * sizeof(spx_int16_t)));
-                        spx_uint32_t out_len = max_out_samples;
-                        spx_int16_t out[SWITCH_RECOMMENDED_BUFFER_SIZE / sizeof(spx_int16_t)];
-
-                        if (tech_pvt->channels == 1)
-                        {
-                            speex_resampler_process_int(tech_pvt->read_resampler,
-                                                        0,
-                                                        (const spx_int16_t *)frame.data,
-                                                        &in_len,
-                                                        &out[0],
-                                                        &out_len);
-                        }
-                        else
-                        {
-                            speex_resampler_process_interleaved_int(tech_pvt->read_resampler,
-                                                                    (const spx_int16_t *)frame.data,
-                                                                    &in_len,
-                                                                    &out[0],
-                                                                    &out_len);
-                        }
-
-                        if (out_len > 0)
-                        {
-                            const size_t bytes_written = out_len * tech_pvt->channels * sizeof(spx_int16_t);
-                            // Always buffer audio - the read_frame_thread will handle sending
-                            if (switch_mutex_trylock(tech_pvt->read_mutex) == SWITCH_STATUS_SUCCESS)
-                            {
-                                size_t available = switch_buffer_freespace(tech_pvt->read_sbuffer);
-                                if (bytes_written <= available)
-                                {
-                                    switch_buffer_write(tech_pvt->read_sbuffer, (const uint8_t *)out, bytes_written);
-                                }
-                                else
-                                {
-                                    // Buffer is full, drop frame to prevent blocking
-                                    switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(switch_core_media_bug_get_session(bug)), SWITCH_LOG_WARNING,
-                                                      "read_sbuffer full, dropping %zu bytes\n", bytes_written);
-                                }
-                                switch_mutex_unlock(tech_pvt->read_mutex);
-                            }
-                        }
-                    }
-                }
-            }
-
-            switch_mutex_unlock(tech_pvt->mutex);
         }
 
         return SWITCH_TRUE;
