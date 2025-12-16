@@ -517,6 +517,83 @@ namespace
         return NULL;
     }
 
+    void *SWITCH_THREAD_FUNC read_frame_thread(switch_thread_t *thread, void *obj)
+    {
+        switch_core_session_t *session = (switch_core_session_t *)obj;
+        switch_channel_t *channel = switch_core_session_get_channel(session);
+        if (!channel)
+            return NULL;
+
+        auto *bug = (switch_media_bug_t *)switch_channel_get_private(channel, MY_BUG_NAME);
+        if (!bug)
+        {
+            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "no media bug in read frame thread\n");
+            return NULL;
+        }
+
+        private_t *tech_pvt = (private_t *)switch_core_media_bug_get_user_data(bug);
+        if (!tech_pvt)
+        {
+            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING, "read_frame_thread: missing tech_pvt\n");
+            return NULL;
+        }
+
+        switch_codec_t *read_codec = switch_core_session_get_read_codec(session);
+        if (!read_codec || !read_codec->implementation)
+        {
+            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING, "read_frame_thread: no read codec available, shutting down\n");
+            return NULL;
+        }
+
+        uint32_t interval = read_codec->implementation->microseconds_per_packet / 1000;
+        uint32_t sample_rate = tech_pvt->wsSampling;
+        uint32_t channels = tech_pvt->channels;
+        uint32_t samples = switch_samples_per_packet(sample_rate, interval);
+        uint32_t bytes = samples * 2 * channels;
+
+        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "started read frame thread with sample rate [%u] interval [%u] samples [%u] bytes [%u]\n", sample_rate, interval, samples, bytes);
+
+        switch_timer_t timer = {0};
+        uint32_t tsamples = read_codec->implementation->actual_samples_per_second;
+
+        if (switch_core_timer_init(&timer, "soft", interval, tsamples, NULL) != SWITCH_STATUS_SUCCESS)
+        {
+            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "Timer Setup Failed. Cannot Start Read Thread\n");
+            return NULL;
+        }
+
+        while (!tech_pvt->close_requested && switch_core_session_running(session))
+        {
+            if (switch_mutex_trylock(tech_pvt->read_mutex) == SWITCH_STATUS_SUCCESS)
+            {
+                if (!tech_pvt->pAudioStreamer)
+                {
+                    switch_mutex_unlock(tech_pvt->read_mutex);
+                    switch_core_timer_next(&timer);
+                    continue;
+                }
+
+                auto *pAudioStreamer = static_cast<AudioStreamer *>(tech_pvt->pAudioStreamer);
+
+                if (pAudioStreamer->isConnected() && !tech_pvt->audio_paused)
+                {
+                    switch_size_t available = switch_buffer_inuse(tech_pvt->read_sbuffer);
+                    if (available >= bytes)
+                    {
+                        std::vector<uint8_t> tmp(bytes);
+                        switch_buffer_read(tech_pvt->read_sbuffer, tmp.data(), bytes);
+                        pAudioStreamer->writeBinary(tmp.data(), bytes);
+                    }
+                }
+                switch_mutex_unlock(tech_pvt->read_mutex);
+            }
+            switch_core_timer_next(&timer);
+        }
+
+        switch_core_timer_destroy(&timer);
+        return NULL;
+    }
+
     switch_status_t stream_data_init(private_t *tech_pvt, switch_core_session_t *session, char *wsUri,
                                      uint32_t sampling, int wsSampling, int channels, char *metadata, responseHandler_t responseHandler,
                                      int deflate, int heart_beat, bool suppressLog, int rtp_packets, const char *extra_headers,
@@ -552,6 +629,7 @@ namespace
 
         switch_mutex_init(&tech_pvt->mutex, SWITCH_MUTEX_NESTED, pool);
         switch_mutex_init(&tech_pvt->write_mutex, SWITCH_MUTEX_NESTED, pool);
+        switch_mutex_init(&tech_pvt->read_mutex, SWITCH_MUTEX_NESTED, pool);
 
         if (switch_buffer_create(pool, &tech_pvt->read_sbuffer, buflen) != SWITCH_STATUS_SUCCESS)
         {
@@ -609,6 +687,11 @@ namespace
         {
             switch_mutex_destroy(tech_pvt->write_mutex);
             tech_pvt->write_mutex = nullptr;
+        }
+        if (tech_pvt->read_mutex)
+        {
+            switch_mutex_destroy(tech_pvt->read_mutex);
+            tech_pvt->read_mutex = nullptr;
         }
         if (tech_pvt->read_sbuffer)
         {
@@ -894,6 +977,17 @@ extern "C"
         return SWITCH_STATUS_SUCCESS;
     }
 
+    switch_status_t stream_session_read_thread_init(switch_core_session_t *session, void *pUserData)
+    {
+        private_t *tech_pvt = (private_t *)pUserData;
+        switch_threadattr_t *thd_attr = NULL;
+        switch_threadattr_create(&thd_attr, switch_core_session_get_pool(session));
+        switch_threadattr_detach_set(thd_attr, 0);
+        switch_threadattr_stacksize_set(thd_attr, SWITCH_THREAD_STACKSIZE);
+        switch_thread_create(&tech_pvt->read_thread, thd_attr, read_frame_thread, session, switch_core_session_get_pool(session));
+        return SWITCH_STATUS_SUCCESS;
+    }
+
     switch_bool_t stream_frame(switch_media_bug_t *bug)
     {
         auto *tech_pvt = (private_t *)switch_core_media_bug_get_user_data(bug);
@@ -934,31 +1028,26 @@ extern "C"
                 switch_frame_t frame = {0};
                 frame.data = data_buf;
                 frame.buflen = SWITCH_RECOMMENDED_BUFFER_SIZE;
-                size_t available = switch_buffer_freespace(tech_pvt->read_sbuffer);
 
                 while (switch_core_media_bug_read(bug, &frame, SWITCH_TRUE) == SWITCH_STATUS_SUCCESS)
                 {
                     if (frame.datalen)
                     {
-                        if (1 == tech_pvt->rtp_packets)
+                        // Always buffer audio - the read_frame_thread will handle sending
+                        if (switch_mutex_trylock(tech_pvt->read_mutex) == SWITCH_STATUS_SUCCESS)
                         {
-                            pAudioStreamer->writeBinary((uint8_t *)frame.data, frame.datalen);
-                            continue;
-                        }
-                        if (available >= frame.datalen)
-                        {
-                            switch_buffer_write(tech_pvt->read_sbuffer, static_cast<uint8_t *>(frame.data), frame.datalen);
-                        }
-                        if (0 == switch_buffer_freespace(tech_pvt->read_sbuffer))
-                        {
-                            switch_size_t inuse = switch_buffer_inuse(tech_pvt->read_sbuffer);
-                            if (inuse > 0)
+                            size_t available = switch_buffer_freespace(tech_pvt->read_sbuffer);
+                            if (available >= frame.datalen)
                             {
-                                std::vector<uint8_t> tmp(inuse);
-                                switch_buffer_read(tech_pvt->read_sbuffer, tmp.data(), inuse);
-                                switch_buffer_zero(tech_pvt->read_sbuffer);
-                                pAudioStreamer->writeBinary(tmp.data(), inuse);
+                                switch_buffer_write(tech_pvt->read_sbuffer, static_cast<uint8_t *>(frame.data), frame.datalen);
                             }
+                            else
+                            {
+                                // Buffer is full, drop frame to prevent blocking
+                                switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(switch_core_media_bug_get_session(bug)), SWITCH_LOG_WARNING,
+                                                  "read_sbuffer full, dropping %zu bytes\n", frame.datalen);
+                            }
+                            switch_mutex_unlock(tech_pvt->read_mutex);
                         }
                     }
                 }
@@ -970,15 +1059,15 @@ extern "C"
                 switch_frame_t frame = {};
                 frame.data = data;
                 frame.buflen = SWITCH_RECOMMENDED_BUFFER_SIZE;
-                const size_t available = switch_buffer_freespace(tech_pvt->read_sbuffer);
 
                 while (switch_core_media_bug_read(bug, &frame, SWITCH_TRUE) == SWITCH_STATUS_SUCCESS)
                 {
                     if (frame.datalen)
                     {
                         spx_uint32_t in_len = frame.samples;
-                        spx_uint32_t out_len = (available / (tech_pvt->channels * sizeof(spx_int16_t)));
-                        spx_int16_t out[available / sizeof(spx_int16_t)];
+                        const size_t max_out_samples = (SWITCH_RECOMMENDED_BUFFER_SIZE / (tech_pvt->channels * sizeof(spx_int16_t)));
+                        spx_uint32_t out_len = max_out_samples;
+                        spx_int16_t out[SWITCH_RECOMMENDED_BUFFER_SIZE / sizeof(spx_int16_t)];
 
                         if (tech_pvt->channels == 1)
                         {
@@ -1001,26 +1090,21 @@ extern "C"
                         if (out_len > 0)
                         {
                             const size_t bytes_written = out_len * tech_pvt->channels * sizeof(spx_int16_t);
-                            if (tech_pvt->rtp_packets == 1)
-                            { // 20ms packet
-                                pAudioStreamer->writeBinary((uint8_t *)out, bytes_written);
-                                continue;
-                            }
-                            if (bytes_written <= available)
+                            // Always buffer audio - the read_frame_thread will handle sending
+                            if (switch_mutex_trylock(tech_pvt->read_mutex) == SWITCH_STATUS_SUCCESS)
                             {
-                                switch_buffer_write(tech_pvt->read_sbuffer, (const uint8_t *)out, bytes_written);
-                            }
-                        }
-
-                        if (switch_buffer_freespace(tech_pvt->read_sbuffer) == 0)
-                        {
-                            switch_size_t inuse = switch_buffer_inuse(tech_pvt->read_sbuffer);
-                            if (inuse > 0)
-                            {
-                                std::vector<uint8_t> tmp(inuse);
-                                switch_buffer_read(tech_pvt->read_sbuffer, tmp.data(), inuse);
-                                switch_buffer_zero(tech_pvt->read_sbuffer);
-                                pAudioStreamer->writeBinary(tmp.data(), inuse);
+                                size_t available = switch_buffer_freespace(tech_pvt->read_sbuffer);
+                                if (bytes_written <= available)
+                                {
+                                    switch_buffer_write(tech_pvt->read_sbuffer, (const uint8_t *)out, bytes_written);
+                                }
+                                else
+                                {
+                                    // Buffer is full, drop frame to prevent blocking
+                                    switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(switch_core_media_bug_get_session(bug)), SWITCH_LOG_WARNING,
+                                                      "read_sbuffer full, dropping %zu bytes\n", bytes_written);
+                                }
+                                switch_mutex_unlock(tech_pvt->read_mutex);
                             }
                         }
                     }
@@ -1050,6 +1134,8 @@ extern "C"
 
             switch_thread_t *write_thread = tech_pvt->write_thread;
             tech_pvt->write_thread = nullptr;
+            switch_thread_t *read_thread = tech_pvt->read_thread;
+            tech_pvt->read_thread = nullptr;
 
             switch_channel_set_private(channel, MY_BUG_NAME, nullptr);
             if (!channelIsClosing)
@@ -1075,6 +1161,16 @@ extern "C"
                 if (join_result != SWITCH_STATUS_SUCCESS)
                 {
                     switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING, "(%s) stream_session_cleanup: failed to join write thread (%d)\n", sessionId, join_result);
+                }
+            }
+
+            if (read_thread)
+            {
+                switch_status_t thread_status = SWITCH_STATUS_SUCCESS;
+                switch_status_t join_result = switch_thread_join(&thread_status, read_thread);
+                if (join_result != SWITCH_STATUS_SUCCESS)
+                {
+                    switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING, "(%s) stream_session_cleanup: failed to join read thread (%d)\n", sessionId, join_result);
                 }
             }
 

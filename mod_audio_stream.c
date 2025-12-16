@@ -114,6 +114,11 @@ static switch_status_t start_capture(switch_core_session_t *session,
         switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "error initializing stream session write thread.\n");
         return SWITCH_STATUS_FALSE;
     }
+    if (SWITCH_STATUS_FALSE == stream_session_read_thread_init(session, pUserData))
+    {
+        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "error initializing stream session read thread.\n");
+        return SWITCH_STATUS_FALSE;
+    }
     return SWITCH_STATUS_SUCCESS;
 }
 

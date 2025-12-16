@@ -35,7 +35,9 @@ struct private_data
     switch_buffer_t *read_sbuffer;
     switch_buffer_t *write_sbuffer;
     switch_mutex_t *write_mutex;
+    switch_mutex_t *read_mutex;
     switch_thread_t *write_thread;
+    switch_thread_t *read_thread;
     int rtp_packets;
 };
 
