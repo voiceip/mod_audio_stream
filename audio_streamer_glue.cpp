@@ -505,33 +505,43 @@ private:
                 switch_core_session_t *psession = switch_core_session_locate(m_sessionId.c_str());
                 if (psession)
                 {
-                    switch (item.event)
+                    try
                     {
-                    case CONNECT_SUCCESS:
-                        send_initial_metadata(psession);
-                        m_notify(psession, EVENT_CONNECT, item.message.c_str());
-                        break;
-                    case CONNECTION_DROPPED:
-                        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(psession), SWITCH_LOG_INFO, "connection closed\n");
-                        m_notify(psession, EVENT_DISCONNECT, item.message.c_str());
-                        break;
-                    case CONNECT_ERROR:
-                        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(psession), SWITCH_LOG_INFO, "connection error\n");
-                        m_notify(psession, EVENT_ERROR, item.message.c_str());
-                        media_bug_close(psession);
-                        break;
-                    case MESSAGE:
-                    {
-                        std::string msg = item.message;
-                        if (processMessage(psession, msg) != SWITCH_TRUE)
+                        switch (item.event)
                         {
-                            m_notify(psession, EVENT_JSON, msg.c_str());
+                        case CONNECT_SUCCESS:
+                            send_initial_metadata(psession);
+                            m_notify(psession, EVENT_CONNECT, item.message.c_str());
+                            break;
+                        case CONNECTION_DROPPED:
+                            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(psession), SWITCH_LOG_INFO, "connection closed\n");
+                            m_notify(psession, EVENT_DISCONNECT, item.message.c_str());
+                            break;
+                        case CONNECT_ERROR:
+                            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(psession), SWITCH_LOG_INFO, "connection error\n");
+                            m_notify(psession, EVENT_ERROR, item.message.c_str());
+                            media_bug_close(psession);
+                            break;
+                        case MESSAGE:
+                        {
+                            std::string msg = item.message;
+                            if (processMessage(psession, msg) != SWITCH_TRUE)
+                            {
+                                m_notify(psession, EVENT_JSON, msg.c_str());
+                            }
+                            if (!m_suppress_log)
+                            {
+                                switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(psession), SWITCH_LOG_DEBUG, "response: %s\n", msg.c_str());
+                            }
+                            break;
                         }
-                        if (!m_suppress_log) {
-                            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(psession), SWITCH_LOG_DEBUG, "response: %s\n", msg.c_str());
                         }
-                        break;
                     }
+                    catch (...)
+                    {
+                        switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,
+                                          "(%s) Exception in worker thread event processing\n",
+                                          m_sessionId.c_str());
                     }
                     switch_core_session_rwunlock(psession);
                 }
