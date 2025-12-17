@@ -143,7 +143,29 @@ public:
         m_worker_thread = std::thread(&AudioStreamer::workerThread, this);
 
         // Now that our callback is setup, we can start our background thread and receive messages
-        client.connect();
+        try
+        {
+            client.connect();
+        }
+        catch (...)
+        {
+            // If connect() throws, we must clean up the worker thread before
+            // the exception propagates, otherwise std::terminate() will be called
+            // when m_worker_thread's destructor runs on a joinable thread.
+            {
+                std::lock_guard<std::mutex> lock(m_queue_mutex);
+                m_shutdown = true;
+            }
+            m_queue_cv.notify_all();
+            
+            if (m_worker_thread.joinable())
+            {
+                m_worker_thread.join();
+            }
+            
+            // Re-throw the exception so the constructor fails properly
+            throw;
+        }
     }
 
     switch_media_bug_t *get_media_bug(switch_core_session_t *session)
